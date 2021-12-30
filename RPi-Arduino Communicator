@@ -1,0 +1,658 @@
+import PySimpleGUI as sg
+import sys
+import glob
+from PySimpleGUI.PySimpleGUI import RELIEF_RAISED
+import serial
+import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.animation as anim
+import threading
+import json
+import time
+import pandas as pd
+import re
+from pathlib import Path
+from datetime import datetime
+from datetime import timedelta
+
+global new_data_available
+global new_response
+global new_data
+global ports
+global ser
+global thread0
+global df
+global should_read
+global selected
+
+global stage
+global relays
+
+global temp_val
+global pres_val
+global co2val
+
+controls_locked = False
+
+is_reading = False
+should_read = False
+
+new_data = {}
+new_data_available = False
+new_response = False
+
+selected = " "
+
+registered_sensors = []
+
+airS1 = 3
+airS2 = 120
+airS3 = 15
+vacS1 = 240
+
+matplotlib.use("TkAgg")
+sg.ChangeLookAndFeel('Black')
+
+# screen_size = (800,600) 
+screen_size = sg.Window.get_screen_size()
+screen_dpi = 80
+px = 1/screen_dpi
+
+df = pd.DataFrame({
+    'Time': [],
+    'Sensor': [],
+    'Value': []
+})
+
+def close_all():
+    stop_monitoring()
+
+
+def cmdStop():
+    global ser
+    write_to_port('/halt', ser)
+
+def cmdAir():
+    global ser
+    write_to_port('/startAirCycle', ser)
+
+def cmdVac():
+    global ser
+    write_to_port('/startVacCycle', ser)
+
+
+
+def cmdSetParam(cycle, stage, val):
+    global ser
+    s = '/set'
+    if cycle == 'air':
+        s = s + 'Air'
+    elif cycle == 'vac':
+        s = s + 'Vac'
+    s = s + 'S'
+    s = s + str(stage)
+    s = s + ' '
+    s = s + str(val)
+    write_to_port(s, ser)
+
+def cmdLock():
+    global ser
+    global controls_locked
+    if controls_locked:
+        write_to_port('/unlock', ser)
+    else:
+        write_to_port('/lock', ser)
+
+
+def handle_response(resp):
+    global airS1
+    global airS2
+    global airS3
+    global vacS1
+    global stage
+    global relays
+    global controls_locked
+    global new_response
+
+    def str2bool(v):
+        return v.lower() in ("yes", "true", "t", "1")
+
+    print("Got response:" + resp)
+    wlist = re.sub("[^\w]", " ",  resp).split()
+    print(wlist)
+    if wlist[0] == 'airS1':
+        airS1 = int(wlist[1])
+    elif wlist[0] == 'airS2':
+        airS2 = int(wlist[1])
+    elif wlist[0] == 'airS3':
+        airS3 = int(wlist[1])
+    elif wlist[0] == 'vacS1':
+        vacS1 = int(wlist[1])
+    elif wlist[0] == 'relay':
+        relays = wlist[1]
+    elif wlist[0] == 'stage':
+        stage = wlist[1]
+    elif wlist[0] == 'lock':
+        controls_locked = str2bool(wlist[1])
+    new_response = True
+
+
+def open_settings():
+    global ports
+    global ser
+    global controls_locked
+
+    col1 = [
+        [sg.T('Stage 1 pressure limit')],
+        [sg.In(key='AIR_S1', size=(15,1), enable_events=True), sg.B("SET", key="A1", font=("JetBrains Mono", 10))]
+    ]
+    col2 = [
+        [sg.T('Stage 2 time limit')],
+        [sg.In(key='AIR_S2', size=(15,1), enable_events=True), sg.B("SET", key="A2", font=("JetBrains Mono", 10))]
+    ]
+    col3 = [
+        [sg.T('Stage 3 time limit')],
+        [sg.In(key='AIR_S3', size=(15,1), enable_events=True), sg.B("SET", key="A3", font=("JetBrains Mono", 10))]
+    ]
+    col4 = [
+        [sg.T('Stage 1 time limit')],
+        [sg.In(key='VAC_S1', size=(15,1), enable_events=True), sg.B("SET", key="A4", font=("JetBrains Mono", 10))]
+    ]
+
+    view = [
+        [sg.B('BACK', key='BACK_BTN',size=(4, 1), font=("JetBrains Mono", 12)), sg.T("Settings", font=("JetBrains Mono", 16))],
+        [sg.T("")],
+        [sg.T('Serial port')],
+        [
+            sg.InputCombo(tuple(ports), size=(40, 1), key="-SERIAL-"),
+            sg.B("UPD", font=("JetBrains Mono", 10), key="-UPD-"),
+            sg.B("SET", key="-SET-", font=("JetBrains Mono", 10))
+        ],
+        [sg.T("")],
+        [sg.T('Air cycle', font=("JetBrains Mono", 16))],
+        [sg.Column(col1), sg.Column(col2), sg.Column(col3)],
+        [sg.T("")],
+        [sg.T('Vacuum cycle')],
+        [sg.Column(col4)],
+        [sg.T("")],
+        [sg.B('LOCK', key='_LOCK_')]
+        
+
+    ]
+
+    window = sg.Window("Settings", view, font=("JetBrains Mono", 16), resizable=True, finalize=True, size=screen_size, no_titlebar=True, keep_on_top=True)
+    window["AIR_S1"].Update(airS1)
+    window["AIR_S2"].Update(airS2)
+    window["AIR_S3"].Update(airS3)
+    window["VAC_S1"].Update(airS1)
+    window["-SERIAL-"].Update(ser.name)
+    
+
+    while True:
+        event, values = window.read(250)
+
+        if new_response:
+            window["AIR_S1"].Update(airS1)
+            window["AIR_S2"].Update(airS2)
+            window["AIR_S3"].Update(airS3)
+            window["VAC_S1"].Update(vacS1)
+
+        if controls_locked:
+            window["_LOCK_"].Update('UNLOCK')
+        else:
+            window["_LOCK_"].Update('LOCK')
+        if event == '_LOCK_':
+            cmdLock()
+        if event is sg.WIN_CLOSED:
+            break
+        if event == 'BACK_BTN':
+            break
+        if event == "-UPD-":
+            if not is_reading:
+                ports = serial_ports()
+                window["-SERIAL-"].Update(tuple(ports))
+        if event == 'A1':
+            if values['AIR_S1'].isnumeric():
+                cmdSetParam('air', 1, values["AIR_S1"])
+            else:
+                window["AIR_S1"].Update(values['AIR_S1'][:-1])
+        if event == 'A2':
+            if values['AIR_S2'].isnumeric():
+                cmdSetParam('air', 2, values["AIR_S2"])
+            else:
+                window["AIR_S2"].Update(values['AIR_S2'][:-1])
+        if event == 'A3':
+            if values['AIR_S3'].isnumeric():
+                cmdSetParam('air', 3, values["AIR_S3"])
+            else:
+                window["AIR_S3"].Update(values['AIR_S3'][:-1])
+        if event == 'A4':
+            if values['VAC_S1'].isnumeric():
+                cmdSetParam('vac', 1, values["VAC_S1"])
+            else:
+                window["VAC_S1"].Update(values['VAC_S1'][:-1])
+        if event == '-SET-':
+            s = values["-SERIAL-"]
+            print(s)
+            if s != '':
+                stop_monitoring()
+                ser = serial.Serial(s, 9600)
+                start_monitoring(ser)
+
+    window.close()
+
+def open_journal():
+    global ports
+
+    the_date = ''
+
+    plt.style.use('dark_background')
+    plt.rc('grid', linestyle="-", color='0.2')
+    plt.rc('font',**{'family':'monospace','monospace':['JetBrains Mono']})
+
+    col2 = [
+        [sg.T("Time interval", font=("JetBrains Mono", 12))],
+        [sg.In(key='-CAL1-', enable_events=True), sg.CalendarButton('BEGIN DATE', target='-CAL1-', format=('%d%b%y'), size=(10,1),key='_CAL_')],
+        [sg.In(key='-CAL2-', enable_events=True), sg.CalendarButton('END DATE', target='-CAL2-', format=('%d%b%y'), size=(10,1),key='_CAL_')],
+        # [sg.B("Start", key="-DRAW-")], 
+        # [sg.B("Stop", key="-STOP-")],
+    ]
+
+    col3 = [
+        [sg.T("Sensors", font=("JetBrains Mono", 12))],
+        [sg.Listbox(values=registered_sensors, size=(12,4), key="-LIST-", enable_events=True)],
+    ]
+
+    col4 = [
+        [sg.T(" ", font=("JetBrains Mono", 12))],
+        [sg.B("SHOW", font=("JetBrains Mono", 16), size=(10,2), key='-SHOW-')]
+    ]
+
+    layout = [
+        [sg.B('BACK', key='BACK_BTN',size=(4,1), font=("JetBrains Mono", 12)), sg.T("Journal", font=("JetBrains Mono", 16))],
+        [sg.Canvas(key=("GRAPH_CANVAS"))], 
+        [sg.Column(col2), sg.Column(col3), sg.Column(col4)],
+    ]
+
+    fig = matplotlib.figure.Figure(figsize=(12,5), dpi=screen_dpi)
+    ax = fig.add_subplot(111)
+    fig.tight_layout()
+    ax.cla()
+    
+
+    window = sg.Window("Ports", layout, font=("JetBrains Mono", 14), resizable=True,finalize=True, size=screen_size, no_titlebar=True, keep_on_top=True)
+    window.bind('<Configure>',"Configure")
+
+    fig_add = draw_figure(window["GRAPH_CANVAS"].TKCanvas, fig)
+
+    today_d = datetime.today()
+    yesterday_d = today_d + timedelta(days=-1)
+    window.Element('-CAL1-').Update(yesterday_d.strftime('%d%b%y'))
+    window.Element('-CAL2-').Update(today_d.strftime('%d%b%y'))
+
+    while True:
+        event, values = window.read(250)
+        if event is sg.WIN_CLOSED:
+            break
+        if event == 'BACK_BTN':
+            break
+        if event == '-SHOW-':
+            begin_d = values["-CAL1-"]
+            end_d = values['-CAL2-']
+            d = get_logs(begin_d, end_d)
+            if len(values["-LIST-"]) == 1:
+                selected = values["-LIST-"][0]
+                p = df.loc[df["Sensor"] == selected]
+                draw(ax, fig, p)
+            fig_add.draw()
+        if event == '-CAL-':
+            print(the_date)
+
+
+    window.close()
+
+
+def main():
+    global new_data_available
+    global new_response
+    global ports
+    global ser
+    global temp_val
+    global pres_val
+    global co2val
+    global relays
+    global stage
+
+    ports = serial_ports()
+
+    if ports:
+        ser = serial.Serial(ports[0], 9600)
+        start_monitoring(ser)
+
+    col1 = [
+        [sg.T('Pressure', font=("JetBrains Mono", 14))], 
+        [sg.T('--', key='PRES_VAL', relief=sg.RELIEF_SUNKEN,size=(10,1))],
+    ]
+
+    col2 = [
+        [sg.T('Temperature', font=("JetBrains Mono", 14))], 
+        [sg.T('--', key='TEM_VAL', relief=sg.RELIEF_SUNKEN,size=(10,1))],
+    ]
+
+    col3 = [
+        [sg.T('CO2', font=("JetBrains Mono", 14))], 
+        [sg.T('--', key='CO2', relief=sg.RELIEF_SUNKEN,size=(10,1))],
+    ]
+
+    main_view = [
+        [sg.Exit(font=("JetBrains Mono", 12)), sg.T("Main menu      ", font=("JetBrains Mono", 16)), sg.B('JOURNAL', key='JOURNAL_BTN',size=(8,1), font=("JetBrains Mono", 12)), sg.B('SETTINGS', key='SETTINGS_BTN',size=(8,1), font=("JetBrains Mono", 12))],
+        [sg.Column(col1), sg.Column(col2), sg.Column(col3)],
+        [sg.T('Stage', font=("JetBrains Mono", 14)), sg.T('--', font=("JetBrains Mono Bold", 14), key='CYCLE_TXT', size=(15,1))],
+        [
+            sg.T('1', key='STAGE1_VAL', relief=sg.RELIEF_SUNKEN,size=(10,1), background_color='#002500', enable_events=True), 
+            sg.T('2', key='STAGE2_VAL', relief=sg.RELIEF_SUNKEN,size=(10,1), background_color='#002500', enable_events=True),
+            sg.T('3', key='STAGE3_VAL', relief=sg.RELIEF_SUNKEN,size=(10,1), background_color='#002500', enable_events=True)],
+        [sg.T('Relays', font=("JetBrains Mono", 14))],
+        [
+            sg.T('1', key='RELAY0', relief=sg.RELIEF_RAISED, background_color='#005000',size=(2,1), enable_events=True), 
+            sg.T('2', key='RELAY1', relief=sg.RELIEF_RAISED, background_color='#005000',size=(2,1), enable_events=True),
+            sg.T('3', key='RELAY2', relief=sg.RELIEF_RAISED, background_color='#005000',size=(2,1), enable_events=True),
+            sg.T('4', key='RELAY3', relief=sg.RELIEF_RAISED, background_color='#005000',size=(2,1), enable_events=True),
+            sg.T('5', key='RELAY4', relief=sg.RELIEF_RAISED, background_color='#005000',size=(2,1), enable_events=True),
+            sg.T('C', key='RELAY5', relief=sg.RELIEF_RAISED, background_color='#005000',size=(2,1), enable_events=True)
+        ],
+        [sg.B('START AIR CYCLE', key='-AIR-'), sg.B('START VACUUM CYCLE', key='-VAC-')],
+        [sg.T(' ', font=("JetBrains Mono", 12), enable_events=True)],
+        [sg.B('STOP', key='STOP_BTN',size=(12,1), button_color='#FF5050', font=("JetBrains Mono", 22))]
+    ]
+
+    window = sg.Window("Main", main_view, font=("JetBrains Mono", 16), resizable=True,finalize=True, size=screen_size, no_titlebar=True, keep_on_top=True)
+    stage = 0
+    relays = '000000'
+    nds = ''
+    
+    while True:
+        event, values = window.read(250)
+
+        if new_data_available:
+            try:
+                nds = new_data['s']
+                if nds is not None:
+                    if nds == 'CO2':
+                        co2_val = new_data['d']
+                        window['CO2'].update(co2_val)
+                    if nds == 'pres2':
+                        pres_val = new_data['d']
+                        window['PRES_VAL'].update(pres_val)
+                    if nds == 'Temp':
+                        temp_val = new_data['d']
+                        window['TEM_VAL'].update(temp_val) 
+            except:
+                pass
+            
+            new_data_available = False
+
+        if new_response:
+            # print(stage)
+            # print(relays[0])
+
+            for i in range(6):
+                if relays[i] == '1':
+                    window['RELAY' + str(i)].update(background_color='green')
+                elif relays[i] == '0':
+                    window['RELAY' + str(i)].update(background_color='#005000')
+
+            if stage == '0':
+                window['CYCLE_TXT'].update('--')
+                window['STAGE1_VAL'].update(background_color='#002500')
+                window['STAGE2_VAL'].update(background_color='#002500')
+                window['STAGE3_VAL'].update(background_color='#002500')
+            elif stage == '1':
+                window['CYCLE_TXT'].update('AIR CYCLE')
+                window['STAGE1_VAL'].update(background_color='green')
+                window['STAGE2_VAL'].update(background_color='#002500')
+                window['STAGE3_VAL'].update(background_color='#002500')
+            elif stage == '2':
+                window['CYCLE_TXT'].update('AIR CYCLE')
+                window['STAGE1_VAL'].update(background_color='#002500')
+                window['STAGE2_VAL'].update(background_color='green')
+                window['STAGE3_VAL'].update(background_color='#002500')
+            elif stage == '3':
+                window['CYCLE_TXT'].update('AIR CYCLE')
+                window['STAGE1_VAL'].update(background_color='#002500')
+                window['STAGE2_VAL'].update(background_color='#002500')
+                window['STAGE3_VAL'].update(background_color='green')
+            elif stage == '4':
+                window['CYCLE_TXT'].update('VACUUM CYCLE')
+                window['STAGE1_VAL'].update(background_color='green')
+                window['STAGE2_VAL'].update(background_color='#002500')
+                window['STAGE3_VAL'].update(background_color='#002500')
+
+            new_response = False
+        if event is sg.WIN_CLOSED:
+            break
+        if event in (None, 'Exit'):
+            break
+        if event == 'JOURNAL_BTN':
+            open_journal()
+        if event == 'SETTINGS_BTN':
+            open_settings()
+        if event == 'STOP_BTN':
+            cmdStop()
+        if event == '-AIR-':
+            cmdAir()
+        if event == '-VAC-':
+            cmdVac()
+
+
+    stop_monitoring()
+    window.close()
+
+
+def draw(ax, fig, d):
+    ax.cla()
+    ax.grid(True)
+    # plt.setp(ax.get_xticklabels(), rotation=30, horizontalalignment='right')
+    fig.tight_layout()
+    ax.plot(d['Time'], d['Value'], color='red')
+    # fig_add = draw_figure(window["GRAPH_CANVAS"].TKCanvas, fig)
+
+
+def draw_figure(canvas, figure, loc=(0, 0)):
+    figure_canvas_agg = FigureCanvasTkAgg(figure, canvas)
+    figure_canvas_agg.draw()
+    figure_canvas_agg.get_tk_widget().pack(side="top", fill="both", expand=1)
+    return figure_canvas_agg
+
+
+def serial_ports():
+    """ Lists serial port names
+
+        :raises EnvironmentError:
+            On unsupported or unknown platforms
+        :returns:
+            A list of the serial ports available on the system
+    """
+    if sys.platform.startswith('win'):
+        ports = ['COM%s' % (i + 1) for i in range(256)]
+    elif sys.platform.startswith('linux') or sys.platform.startswith('cygwin'):
+        # this excludes your current terminal "/dev/tty"
+        ports = glob.glob('/dev/tty[A-Za-z]*')
+    elif sys.platform.startswith('darwin'):
+        ports = glob.glob('/dev/tty.*')
+    else:
+        raise EnvironmentError('Unsupported platform')
+
+    result = []
+    for port in ports:
+        try:
+            s = serial.Serial(port)
+            s.close()
+            result.append(port)
+        except (OSError, serial.SerialException):
+            pass
+    print(result)
+    return result
+
+def read_from_port(ser):
+    global is_reading
+    # buffer = ""
+    while True:
+        if should_read:
+            try:
+                is_reading = True
+                reading = ser.readline().decode()  
+            except serial.SerialException as e:
+                #Disconnect of USB->UART occured
+                print("Disconnect of USB->UART occured")
+                ser.close()
+                is_reading = False
+                return None
+            except:
+                pass
+            is_reading = False
+            handle_data(reading)
+
+def write_to_port(s, ser):
+    global is_reading
+    s = s + '\r\n'
+    # while is_reading == True:
+    #     pass
+
+    try:
+        ser.write(s.encode('ascii'))
+        print('Sent: ' + s)
+    except:
+        print("Couldn't send cmd")
+    # time.sleep(2)
+
+def processDate(d):
+    raw_date = re.sub('[^0-9]', ' ', d)
+    dt = time.strptime(raw_date, "%d %m %y")
+    f_date = time.strftime('%d%b%y', dt)
+    return f_date
+
+def get_logs(begin_date, end_date):
+    begin_time = "00 00"
+    end_time = "23 59"
+    bd = time.strptime(begin_date, "%d%b%y")
+    ed = time.strptime(end_date, "%d%b%y")
+    bt = time.strptime(begin_time, "%H %M")
+    et = time.strptime(end_time, "%H %M")
+    dat = datetime(int(time.strftime('%Y', bd)), int(time.strftime('%m', bd)), int(time.strftime('%d', bd)), int(time.strftime('%H', bt)), int(time.strftime('%M', bt)))
+    dat_i = dat
+    end = datetime(int(time.strftime('%Y', ed)), int(time.strftime('%m', ed)), int(time.strftime('%d', ed)), int(time.strftime('%H', et)), int(time.strftime('%M', et)))
+    # end = end + timedelta(days=1)
+    # print(dat, end)
+    files = []
+    d = []
+    while dat_i <= end:
+        try:
+            dd = dat_i.strftime('%d%b%y')
+            # print(dd)
+            the_path = dd + ".csv"
+            the_log = Path(the_path)
+            if the_log.is_file():
+                print('Path:', the_path)
+                print('Date:', dat_i)
+                df = pd.read_csv(the_log, index_col=None)
+                # print(df)
+                for i in df.index:
+                    # print('t:', df['Time'][i])
+                    ti = time.strptime(df['Time'][i], "%H:%M:%S")
+                    tti = datetime(int(dat_i.strftime('%Y')), int(dat_i.strftime('%m')), int(dat_i.strftime('%d')), int(time.strftime('%H', ti)), int(time.strftime('%M', ti)))
+                    # print(tti>end)
+                    if tti > end or tti < dat:
+                        # print("not in range", tti)
+                        df.drop(index=i)
+                    else:
+                        print("Time:", tti)
+                        r = df.iloc[[i]]
+                        # print(r)
+                        d.append(r)
+                files.append(the_path)
+                # print(the_path)
+        except:
+            pass
+        dat_i = dat_i + timedelta(days=1)
+    print("INFO/Menu: Found logs")
+
+    try:
+        df = pd.concat(d, ignore_index=True)
+        return df
+    except:
+        print("WARNING/Menu: Couldn't concatenate logs")
+    return d
+
+
+
+def handle_data(data):
+    global new_data_available
+    global new_data
+    global df
+    # print(data)
+    new_data = {}
+    if data[0] == '/':
+            handle_response(data)
+    try:
+        if data[0] == '/':
+            handle_response(data)
+        else:
+            new_data = json.loads(data)
+            # print(new_data)
+            date = time.strftime("%d%b%y", time.localtime())
+            tim = time.strftime("%H:%M:%S", time.localtime())
+            todays_log_path = date + ".csv"
+            todays_log = Path(todays_log_path)
+            print(new_data)
+            new_data_available = True
+            df_now = pd.DataFrame({
+                    'Time': [tim],
+                    'Sensor': [new_data['s']],
+                    'Value': [int(new_data['d'])]
+                    })
+            df = df.append(df_now)
+            df = df[-30:]
+
+            if not new_data['s'] in registered_sensors:
+                print("Added " + new_data['s'] + " to known sensors")
+                registered_sensors.append(new_data['s'])
+            
+            # save log
+            if todays_log.is_file():
+                # read log
+                df_now.to_csv(todays_log_path, mode='a', header=False, index=False)
+                log = pd.read_csv(todays_log_path)
+            else:
+                # create log file
+                df_now.to_csv(todays_log_path, index=False)
+
+            # print(df_now)
+            # print(df)
+
+    except:
+        print("Unrecognized format string, ignoring")
+    
+    # notify_new_data(new_data, sen)
+
+def start_monitoring(ser):
+    global thread0
+    global should_read
+    should_read = True
+    print("Starting reading")
+    thread0 = threading.Thread(target=read_from_port, args=(ser,))
+    thread0.start()
+
+def stop_monitoring():
+    global should_read
+    global thread0
+    print("Stopping reading")
+    should_read = False
+    # ser.close()
+    # thread0._Thread__stop()
+
+
+if __name__ == "__main__":
+    main()
+    sys.exit()
